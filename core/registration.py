@@ -6,7 +6,7 @@ from scipy.spatial import cKDTree
 
 
 def _rigid_transform_svd(src: np.ndarray, tgt: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Compute optimal rotation R and translation t minimizing ||tgt - R@src - t||² via SVD."""
+    # least-squares rigid alignment (Kabsch/Umeyama), reflection-corrected
     src_c = src.mean(axis=0)
     tgt_c = tgt.mean(axis=0)
     A = (src - src_c).T @ (tgt - tgt_c)
@@ -26,11 +26,7 @@ def align_point_cloud_to_mesh(
     n_ref: int = 10000,
     tol: float = 1e-5,
 ) -> tuple[np.ndarray, np.ndarray, float]:
-    """
-    Align pcd_points to mesh surface via ICP.
-    Returns (aligned_points, 4x4 homogeneous transform, fitness).
-    fitness = fraction of correspondences within 2× mean final distance.
-    """
+    """Point-to-point ICP. Returns (aligned_points, 4x4 transform, fitness)."""
     ref_pts, _ = trimesh.sample.sample_surface(mesh, n_ref)
     tree = cKDTree(ref_pts)
 

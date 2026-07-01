@@ -6,16 +6,13 @@ import tempfile
 
 
 def compute_deviation(points: np.ndarray, mesh: trimesh.Trimesh) -> np.ndarray:
-    """
-    Compute unsigned distance from each scan point to the nearest mesh surface.
-    Returns array of shape (N,) in mesh units.
-    """
+    """Unsigned distance from each scan point to the nearest mesh surface, in mesh units."""
     _, distances, _ = trimesh.proximity.closest_point(mesh, points)
     return distances
 
 
 def _distance_to_rgb(distances: np.ndarray, tolerance: float) -> np.ndarray:
-    """Map distances to RGB: green (0) → yellow (tolerance) → red (>tolerance)."""
+    # green at 0, red at >= tolerance
     ratio = np.clip(distances / tolerance, 0, 1)
     r = np.clip(2 * ratio, 0, 1)
     g = np.clip(2 * (1 - ratio), 0, 1)
@@ -29,15 +26,13 @@ def colorize_mesh_by_deviation(
     distances: np.ndarray,
     tolerance: float,
 ) -> str:
-    """
-    Interpolate point deviation values onto mesh vertices and export colored GLB.
-    Returns path to a temporary GLB file for Gradio's Model3D component.
-    """
+    """Interpolate point deviations onto mesh vertices, export a colored GLB, return its path."""
     from scipy.spatial import cKDTree
 
     point_colors = _distance_to_rgb(distances, tolerance)
     vertices = np.array(mesh.vertices)
 
+    # Interpolate point colors onto mesh vertices using inverse-distance weighting
     tree = cKDTree(points)
     k = min(5, len(points))
     dists, idxs = tree.query(vertices, k=k)

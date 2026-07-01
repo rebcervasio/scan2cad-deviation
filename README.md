@@ -1,73 +1,40 @@
 # Scan-to-CAD Deviation Analyzer
 
-A manufacturing QA tool that quantifies the geometric deviation between a designed CAD part and its physical scan — enabling automated tolerance verification at scale.
-
-![Demo: deviation heatmap on a mechanical bracket](assets/demo_screenshot.png)
+Quantifies the geometric gap between a designed CAD part and its physical scan (the "as-designed vs. as-built" delta that every manufacturing QA pipeline has to deal with eventually).
 
 ## What it does
 
-Upload a **reference CAD mesh** (STL/OBJ) and an **as-built point cloud scan** (PLY/XYZ). The tool:
+Upload a reference CAD mesh (STL/OBJ) and an as-built point cloud scan (PLY/XYZ). The tool aligns the scan to the CAD reference with ICP (a from-scratch SVD-based implementation, no Open3D), computes per-point distance to the CAD surface, and renders the result as a green→red deviation heatmap on the mesh, plus max/mean/RMS stats and a distribution histogram. No scan on hand? Flip on "Simulate scan from CAD" and it'll generate one with configurable noise.
 
-1. **Aligns** the scan to the CAD reference via ICP (Iterative Closest Point) — custom SVD-based implementation, no external registration library required
-2. **Computes** per-point distance from scan to CAD surface using spatial proximity queries
-3. **Colorizes** the CAD mesh as a deviation heatmap: green (within tolerance) → red (out of tolerance)
-4. **Reports** key QA statistics: max/mean/RMS deviation, % within tolerance
-
-No scan available? Enable **Simulate scan** to generate realistic manufacturing noise on top of the CAD geometry.
-
-## Why this matters
-
-This bridges the core gap in digital manufacturing: the "design–build" delta. Every manufactured part deviates from its CAD geometry due to machining tolerances, material deformation, and assembly stresses. Quantifying this deviation at scale — from point cloud data — is fundamental to automated QA pipelines.
+A second tab runs the same pipeline across a simulated production batch instead of one part: N parts off the same CAD reference, each with baseline measurement noise, and a tool-wear defect that grows in after a chosen part number. Deviations get bucketed into spatial zones (k-means) and tracked with a Hotelling's T² control chart (the standard multivariate SPC approach for catching a process drifting out of control before any single part fails its tolerance outright).
 
 ## Quickstart
 
 ```bash
 pip install -r requirements.txt
 python generate_sample.py   # creates assets/sample_bracket.stl
-python app.py               # launches at http://localhost:7860
+python app.py                # http://localhost:7860
 ```
 
-Then click **Load Demo Part → Run Analysis** to see it in action.
+Click **Load Demo Part → Run Analysis** to see it work end to end.
 
-## Stack
+## Layout
 
-| Component | Library |
-|-----------|---------|
-| Mesh I/O + surface sampling | `trimesh` |
-| ICP registration | Custom SVD implementation (`numpy`, `scipy`) |
-| Point-to-surface distance | `trimesh.proximity` + `scipy.spatial.cKDTree` |
-| 3D colored mesh export | `trimesh` → GLB |
-| Web UI | `gradio` |
-| Deviation histogram | `plotly` |
+- `app.py` (Gradio UI)
+- `core/simulation.py` (synthetic scan generation)
+- `core/registration.py` (ICP alignment)
+- `core/deviation.py` (point-to-mesh distance, heatmap colorization)
+- `core/batch_analysis.py` (production-run simulation, Hotelling's T² SPC)
+- `generate_sample.py` (builds the demo bracket STL)
 
-## Project structure
-
-```
-scan2cad-deviation/
-├── app.py                  # Gradio web app
-├── core/
-│   ├── simulation.py       # Synthetic scan generator
-│   ├── registration.py     # ICP alignment (SVD-based)
-│   └── deviation.py        # Point-to-mesh distance + colorization
-├── assets/
-│   └── sample_bracket.stl  # Demo mechanical part
-├── generate_sample.py      # Generates the demo STL
-└── requirements.txt
-```
-
-## Input formats
-
-| Type | Formats |
-|------|---------|
-| CAD mesh | STL, OBJ |
-| Point cloud scan | PLY, XYZ (space-separated x y z) |
+Built on `trimesh` for mesh I/O/sampling, `scipy` for the KD-tree queries, k-means, and F-distribution control limits, `gradio` for the UI, `plotly` for the charts.
 
 ## Example output
 
-For a bracket with 0.8mm manufacturing noise and ±0.5mm tolerance:
+Bracket with 0.8mm of simulated manufacturing noise, ±0.5mm tolerance:
 
 ```
-✅ 52.3% of scan points within ±0.5 mm tolerance
+52.3% of scan points within ±0.5 mm tolerance
 Max: 2.83 mm | Mean: 0.61 mm | RMS: 0.77 mm | Median: 0.51 mm
 ICP fitness: 0.977
 ```

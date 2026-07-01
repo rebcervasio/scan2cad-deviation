@@ -11,10 +11,7 @@ def simulate_scan(
     rigid_translation: np.ndarray = None,
     rigid_rotation_deg: float = 0.0,
 ) -> np.ndarray:
-    """
-    Sample points from mesh surface, add Gaussian noise and an optional rigid offset.
-    Returns (N, 3) numpy array.
-    """
+    """Sample the mesh surface and add Gaussian noise plus an optional rigid offset."""
     points, _ = trimesh.sample.sample_surface(mesh, n_points)
     points = points + np.random.normal(0, noise_std, points.shape)
 

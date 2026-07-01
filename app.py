@@ -12,11 +12,24 @@ import plotly.graph_objects as go
 import trimesh
 
 sys.path.insert(0, os.path.dirname(__file__))
+from core.batch_analysis import colorize_mesh_by_mode, pca_drift_analysis, project_tolerance_crossing, simulate_production_run
 from core.deviation import colorize_mesh_by_deviation, compute_deviation, compute_statistics
 from core.registration import align_point_cloud_to_mesh
 from core.simulation import simulate_scan
 
 SAMPLE_STL = os.path.join(os.path.dirname(__file__), "assets", "sample_bracket.stl")
+
+BATCH_DESCRIPTION = """
+### 📈 Production Run — Hotelling's T² Drift Detection
+
+Simulates a production run of N parts sharing one CAD reference, each with baseline
+measurement noise plus a **localized tool-wear defect that grows after a chosen part
+number**. Deviations are aggregated into spatial zones (k-means) and monitored with a
+**Hotelling's T² control chart** — the standard multivariate SPC technique (Mahalanobis
+distance from the baseline/Phase-I reference, F-distribution control limit) — to detect
+*when* the process drifts out of statistical control, ahead of any single part failing
+its physical tolerance.
+"""
 
 DESCRIPTION = """
 # 🔬 Scan-to-CAD Deviation Analyzer
@@ -135,53 +148,183 @@ def load_demo(_):
     return SAMPLE_STL, True, 1.2, 6000, 0.5, True
 
 
+def make_t2_chart(t2: np.ndarray, ucl: float, n_baseline: int, first_violation) -> go.Figure:
+    parts = np.arange(len(t2))
+    fig = go.Figure()
+    fig.add_vrect(x0=-0.5, x1=n_baseline - 0.5, fillcolor="lightgreen", opacity=0.15, line_width=0,
+                  annotation_text="baseline (Phase I)", annotation_position="top left")
+    fig.add_trace(go.Scatter(x=parts, y=t2, mode="lines+markers", name="T² (Hotelling)", marker_color="steelblue"))
+    fig.add_hline(y=ucl, line_dash="dash", line_color="red", annotation_text="UCL (α=0.27%)", annotation_position="top right")
+    if first_violation is not None:
+        fig.add_vline(x=first_violation, line_dash="dot", line_color="orange",
+                       annotation_text=f"first violation: part {first_violation}", annotation_position="bottom right")
+    fig.update_layout(
+        title="Hotelling's T² Control Chart (multivariate SPC)",
+        xaxis_title="Part number in production run",
+        yaxis_title="T² statistic",
+        yaxis_type="log",
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        height=350,
+        margin=dict(l=40, r=20, t=40, b=40),
+    )
+    return fig
+
+
+def run_batch_analysis(
+    cad_file,
+    n_parts: float,
+    base_noise_std: float,
+    drift_start_part: float,
+    drift_rate: float,
+    n_baseline: float,
+    tolerance: float,
+):
+    if cad_file is None:
+        raise gr.Error("Please upload a CAD mesh (STL or OBJ) above first.")
+
+    n_parts = int(n_parts)
+    drift_start_part = int(drift_start_part)
+    n_baseline = int(n_baseline)
+
+    mesh = load_mesh(cad_file.name)
+    diag = float(np.linalg.norm(mesh.bounds[1] - mesh.bounds[0]))
+    if diag < 1.0:
+        mesh.apply_scale(1000)
+
+    run = simulate_production_run(
+        mesh,
+        n_parts=n_parts,
+        n_points=1200,
+        base_noise_std=base_noise_std,
+        drift_start_part=drift_start_part,
+        drift_rate=drift_rate,
+        seed=0,
+    )
+
+    if n_baseline <= run["n_zones"]:
+        raise gr.Error(
+            f"Baseline parts ({n_baseline}) must exceed the number of monitoring zones "
+            f"({run['n_zones']}) for a stable covariance estimate — increase baseline parts."
+        )
+    if n_baseline >= n_parts - 5:
+        raise gr.Error("Leave at least 5 parts after the baseline window for monitoring.")
+    if n_baseline > drift_start_part:
+        gr.Warning("Baseline window overlaps the simulated drift onset — control limits may be contaminated.")
+
+    result = pca_drift_analysis(run["deviations"], run["zone_ids"], run["n_zones"], n_baseline=n_baseline)
+    fig = make_t2_chart(result["t2"], result["ucl"], n_baseline, result["first_violation_part"])
+    mode_glb = colorize_mesh_by_mode(mesh, run["canonical_points"], result["point_loading"])
+
+    max_dev_per_part = run["deviations"].max(axis=1)
+    fit_from = result["first_violation_part"] if result["first_violation_part"] is not None else drift_start_part
+    crossing = project_tolerance_crossing(np.arange(n_parts), max_dev_per_part, tolerance, fit_from)
+
+    if result["first_violation_part"] is None:
+        summary = (
+            f"### ✅ Process stayed in statistical control for all {n_parts} simulated parts\n\n"
+            f"No part exceeded the Hotelling T² control limit (UCL={result['ucl']:.1f}, α=0.27%)."
+        )
+    else:
+        fv = result["first_violation_part"]
+        delay = fv - drift_start_part
+        summary = (
+            f"### ⚠️ Out-of-control signal detected at part #{fv}\n\n"
+            f"Hotelling's T² exceeded the control limit ({result['t2'][fv]:.1f} > UCL {result['ucl']:.1f}) "
+            f"— {delay} parts after the simulated tool-wear onset (part #{drift_start_part}).\n\n"
+        )
+        if crossing is not None:
+            summary += f"At the current drift trend, the physical ±{tolerance} mm tolerance is projected to be exceeded around **part #{crossing}**."
+        else:
+            summary += f"The drift trend doesn't yet project a ±{tolerance} mm tolerance crossing within this run."
+
+    diagnostics = {
+        "n_zones": run["n_zones"],
+        "n_baseline": n_baseline,
+        "ucl": round(result["ucl"], 2),
+        "baseline_covariance_explained_variance_ratio": [round(v, 4) for v in result["explained_variance_ratio"]],
+        "first_violation_part": result["first_violation_part"],
+        "projected_tolerance_crossing_part": crossing,
+        "max_t2": round(float(result["t2"].max()), 2),
+    }
+
+    return fig, mode_glb, summary, diagnostics
+
+
 with gr.Blocks(title="Scan-to-CAD Deviation Analyzer", theme=gr.themes.Soft()) as demo:
     gr.Markdown(DESCRIPTION)
 
-    with gr.Row():
-        with gr.Column(scale=1):
-            gr.Markdown("### 📂 Inputs")
-            cad_file = gr.File(
-                label="CAD Reference Mesh (STL / OBJ)",
-                file_types=[".stl", ".obj"],
-            )
-            scan_file = gr.File(
-                label="Scan Point Cloud (PLY / XYZ) — optional",
-                file_types=[".ply", ".xyz", ".txt"],
-            )
+    gr.Markdown("### 📂 CAD Reference (shared by both tabs below)")
+    cad_file = gr.File(
+        label="CAD Reference Mesh (STL / OBJ)",
+        file_types=[".stl", ".obj"],
+    )
 
-            gr.Markdown("### 🎲 Scan Simulation")
-            use_sim = gr.Checkbox(
-                label="Simulate scan from CAD (ignore uploaded scan)", value=True
-            )
-            noise_std = gr.Slider(
-                0.05, 5.0, value=1.2, step=0.05,
-                label="Simulated noise std (mm) — mimics manufacturing variation",
-            )
-            n_points = gr.Slider(
-                500, 20000, value=6000, step=500,
-                label="Number of scan points",
-            )
+    with gr.Tabs():
+        with gr.Tab("Single Part Analysis"):
+            with gr.Row():
+                with gr.Column(scale=1):
+                    scan_file = gr.File(
+                        label="Scan Point Cloud (PLY / XYZ) — optional",
+                        file_types=[".ply", ".xyz", ".txt"],
+                    )
 
-            gr.Markdown("### ⚙️ Analysis Settings")
-            tolerance = gr.Slider(
-                0.05, 5.0, value=0.5, step=0.05,
-                label="Tolerance threshold (mm) — parts outside this are flagged red",
-            )
-            run_icp = gr.Checkbox(label="Run ICP alignment (recommended for real scans)", value=True)
+                    gr.Markdown("### 🎲 Scan Simulation")
+                    use_sim = gr.Checkbox(
+                        label="Simulate scan from CAD (ignore uploaded scan)", value=True
+                    )
+                    noise_std = gr.Slider(
+                        0.05, 5.0, value=1.2, step=0.05,
+                        label="Simulated noise std (mm) — mimics manufacturing variation",
+                    )
+                    n_points = gr.Slider(
+                        500, 20000, value=6000, step=500,
+                        label="Number of scan points",
+                    )
+
+                    gr.Markdown("### ⚙️ Analysis Settings")
+                    tolerance = gr.Slider(
+                        0.05, 5.0, value=0.5, step=0.05,
+                        label="Tolerance threshold (mm) — parts outside this are flagged red",
+                    )
+                    run_icp = gr.Checkbox(label="Run ICP alignment (recommended for real scans)", value=True)
+
+                    with gr.Row():
+                        demo_btn = gr.Button("▶ Load Demo Part", variant="secondary")
+                        run_btn = gr.Button("🔍 Run Analysis", variant="primary")
+
+                with gr.Column(scale=2):
+                    gr.Markdown("### 🎨 Deviation Heatmap")
+                    model_view = gr.Model3D(label="Colored CAD Mesh (green=ok, red=deviation)")
+                    summary_md = gr.Markdown()
 
             with gr.Row():
-                demo_btn = gr.Button("▶ Load Demo Part", variant="secondary")
-                run_btn = gr.Button("🔍 Run Analysis", variant="primary")
+                histogram = gr.Plot(label="Deviation Histogram")
+                stats_json = gr.JSON(label="Full QA Statistics")
 
-        with gr.Column(scale=2):
-            gr.Markdown("### 🎨 Deviation Heatmap")
-            model_view = gr.Model3D(label="Colored CAD Mesh (green=ok, red=deviation)")
-            summary_md = gr.Markdown()
+        with gr.Tab("Production Run — PCA Drift Detection"):
+            gr.Markdown(BATCH_DESCRIPTION)
+            with gr.Row():
+                with gr.Column(scale=1):
+                    batch_n_parts = gr.Slider(20, 100, value=60, step=5, label="Number of parts in production run")
+                    batch_n_baseline = gr.Slider(15, 40, value=20, step=1,
+                                                  label="Baseline (Phase I) parts used to fit control limits")
+                    batch_noise_std = gr.Slider(0.01, 0.3, value=0.05, step=0.01,
+                                                 label="Baseline process noise std (mm)")
+                    batch_drift_start = gr.Slider(5, 80, value=20, step=1, label="Part # when tool wear begins")
+                    batch_drift_rate = gr.Slider(0.005, 0.08, value=0.025, step=0.005,
+                                                  label="Wear growth rate (mm/part)")
+                    batch_tolerance = gr.Slider(0.1, 2.0, value=0.5, step=0.05,
+                                                 label="Physical tolerance (mm) for crossing projection")
+                    run_batch_btn = gr.Button("📈 Run Production Simulation", variant="primary")
 
-    with gr.Row():
-        histogram = gr.Plot(label="Deviation Histogram")
-        stats_json = gr.JSON(label="Full QA Statistics")
+                with gr.Column(scale=2):
+                    control_chart = gr.Plot(label="Hotelling's T² Control Chart")
+                    batch_summary_md = gr.Markdown()
+
+            with gr.Row():
+                mode_view = gr.Model3D(label="Zones driving the signal (red = growing, blue = shrinking, for the flagged part)")
+                batch_json = gr.JSON(label="SPC Diagnostics")
 
     # Demo button: load sample STL and set parameters
     demo_btn.click(
@@ -194,6 +337,12 @@ with gr.Blocks(title="Scan-to-CAD Deviation Analyzer", theme=gr.themes.Soft()) a
         fn=run_analysis,
         inputs=[cad_file, scan_file, use_sim, noise_std, n_points, tolerance, run_icp],
         outputs=[model_view, histogram, stats_json, summary_md],
+    )
+
+    run_batch_btn.click(
+        fn=run_batch_analysis,
+        inputs=[cad_file, batch_n_parts, batch_noise_std, batch_drift_start, batch_drift_rate, batch_n_baseline, batch_tolerance],
+        outputs=[control_chart, mode_view, batch_summary_md, batch_json],
     )
 
 if __name__ == "__main__":
